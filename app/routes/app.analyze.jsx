@@ -9,36 +9,39 @@ async function analyzeReview(reviewText, openai) {
     messages: [
       {
         role: "system",
-        content: `Sen bir e-ticaret yorum analiz uzmanısın.
-        Verilen yorumu analiz et ve JSON formatında şunu döndür:
-        {
-          "sentiment": "positive" veya "negative" veya "neutral",
-          "score": -100 ile 100 arası puan,
-          "categories": ["kargo", "kalite", "fiyat", "musteri hizmetleri", "urun"],
-          "summary": "kısa özet Türkçe",
-          "action": "mağaza sahibi ne yapmalı"
-        }`,
+        content: `Sen bir e-ticaret yorum analiz uzmanısın. Verilen yorumu analiz et ve SADECE JSON formatında döndür:
+{
+  "sentiment": "positive" veya "negative" veya "neutral",
+  "score": -100 ile 100 arası tam sayı,
+  "categories": ["kargo", "kalite", "fiyat", "musteri_hizmetleri", "urun", "ambalaj"] listesinden uygun olanlar,
+  "summary": "maksimum 10 kelimelik Türkçe özet",
+  "action": "mağaza sahibine 1 cümle öneri"
+}`,
       },
-      {
-        role: "user",
-        content: reviewText,
-      },
+      { role: "user", content: reviewText },
     ],
     response_format: { type: "json_object" },
   });
-
   return JSON.parse(completion.choices[0].message.content);
 }
 
 export const action = async ({ request }) => {
   const { session } = await authenticate.admin(request);
 
-  const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-  });
+  if (!process.env.OPENAI_API_KEY) {
+    return data(
+      {
+        success: false,
+        error:
+          "OPENAI_API_KEY ayarlanmamış. Railway ortam değişkenlerini kontrol edin.",
+      },
+      { status: 500 }
+    );
+  }
+
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
   try {
-    // Veritabanından bu mağazanın yorumlarını çek
     const reviews = await db.review.findMany({
       where: { shop: session.shop },
       orderBy: { createdAt: "desc" },
@@ -48,36 +51,60 @@ export const action = async ({ request }) => {
     if (reviews.length === 0) {
       return data({
         success: false,
-        error: "Henüz yorum yok. Ürün sayfanıza yorum widget'ı eklendikten sonra müşteriler yorum bıraktığında burada görünecek.",
+        error:
+          "Henüz yorum yok. Ayarlar sayfasındaki widget kodunu ürün sayfanıza ekleyin.",
       });
     }
 
-    // Her yorumu AI ile analiz et
-    const results = await Promise.all(
-      reviews.map(async (review) => {
-        const analysis = await analyzeReview(review.body, openai);
-        return {
-          product: review.productTitle,
-          text: review.body,
-          rating: review.rating,
-          author: review.author,
-          analysis,
-        };
-      })
-    );
+    // 5'li batch'ler halinde işle — OpenAI rate limit koruması
+    const BATCH_SIZE = 5;
+    const results = [];
 
-    // İstatistikleri hesapla
+    for (let i = 0; i < reviews.length; i += BATCH_SIZE) {
+      const batch = reviews.slice(i, i + BATCH_SIZE);
+      const batchResults = await Promise.all(
+        batch.map(async (review) => {
+          try {
+            const analysis = await analyzeReview(review.body, openai);
+            return {
+              product: review.productTitle,
+              text: review.body,
+              rating: review.rating,
+              author: review.author,
+              analysis,
+            };
+          } catch {
+            return {
+              product: review.productTitle,
+              text: review.body,
+              rating: review.rating,
+              author: review.author,
+              analysis: {
+                sentiment: "neutral",
+                score: 0,
+                categories: [],
+                summary: "Analiz başarısız",
+                action: "—",
+              },
+            };
+          }
+        })
+      );
+      results.push(...batchResults);
+    }
+
     const negative = results.filter((r) => r.analysis.sentiment === "negative");
     const positive = results.filter((r) => r.analysis.sentiment === "positive");
 
     const categoryCounts = {};
     negative.forEach((r) => {
-      r.analysis.categories.forEach((cat) => {
+      (r.analysis.categories || []).forEach((cat) => {
         categoryCounts[cat] = (categoryCounts[cat] || 0) + 1;
       });
     });
-
-    const topCategory = Object.entries(categoryCounts).sort((a, b) => b[1] - a[1])[0];
+    const topCategory = Object.entries(categoryCounts).sort(
+      (a, b) => b[1] - a[1]
+    )[0];
 
     return data({
       success: true,
@@ -85,11 +112,17 @@ export const action = async ({ request }) => {
         total: results.length,
         negative: negative.length,
         positive: positive.length,
+        neutral: results.length - negative.length - positive.length,
+        negativeRate: Math.round((negative.length / results.length) * 100),
         topComplaint: topCategory ? topCategory[0] : "—",
       },
       reviews: results,
     });
   } catch (error) {
-    return data({ success: false, error: error.message }, { status: 500 });
+    console.error("Analiz hatası:", error);
+    return data(
+      { success: false, error: `Analiz başarısız: ${error.message}` },
+      { status: 500 }
+    );
   }
 };
